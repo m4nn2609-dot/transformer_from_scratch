@@ -218,7 +218,6 @@ Triton optional (for FlashAttention-2 kernel and torch.compile — not available
 
 - Train 50,000+ steps for coherent TinyStories-quality output
 - Deploy to Hugging Face Hub
-- Add DDP multi-GPU benchmarks on rented hardware
 - Implement Triton FlashAttention-2 on Linux
 - Add more ablations and longer training curves
 
