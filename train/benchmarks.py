@@ -6,15 +6,16 @@ import os
 import sys
 import time
 
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _d in (_REPO_ROOT, os.path.join(_REPO_ROOT, "model"), os.path.join(_REPO_ROOT, "tokenizer"), os.path.join(_REPO_ROOT, "train")):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
+
 import torch
 
-_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
-
-from model.lm import LanguageModel
-from train.cross_entropy import cross_entropy
-from train.adamw import AdamW
+from lm import LanguageModel
+from cross_entropy import cross_entropy
+from adamw import AdamW
 
 
 def make_model(vocab_size, d_model, n_layers, n_heads, d_ff, device, dtype):
@@ -95,10 +96,10 @@ def main():
                 loss.backward()
                 opt.zero_grad(set_to_none=True)
         elif flash_attn:
-            from train.flash_attn_triton import flash_attn_forward, HAS_TRITON
+            from flash_attn_triton import flash_attn_forward, HAS_TRITON
             if not HAS_TRITON:
                 continue
-            import train.attention as attn_mod
+            import attention as attn_mod
             attn_mod.scaled_dot_product_attention = lambda q, k, v, causal=False: flash_attn_forward(q, k, v, causal)
 
             def f():

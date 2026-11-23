@@ -1,10 +1,12 @@
 """Main training loop for the language model.
 
 Usage:
-    python train/train.py --memmap data/tokenizer/tinystories_uint16.bin \
+    python train/training_loop.py --memmap data/tokenizer/tinystories_uint16.bin \
         --vocab-size 10000 --d-model 512 --n-layers 4 --n-heads 16 \
         --d-ff 2048 --batch-size 16 --seq-len 256 --max-steps 5000 \
         --device cuda --save-dir checkpoints/
+
+Device-agnostic: --device cuda (if available) or cpu.
 """
 
 import argparse
@@ -14,18 +16,21 @@ import sys
 import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+for _d in (_REPO_ROOT, os.path.join(_REPO_ROOT, "model"), os.path.join(_REPO_ROOT, "tokenizer")):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
+if os.path.join(_REPO_ROOT, "train") not in sys.path:
+    sys.path.insert(0, os.path.join(_REPO_ROOT, "train"))
 
 import torch
 import numpy as np
 
-from model.lm import LanguageModel
-from train.cross_entropy import cross_entropy
-from train.adamw import AdamW
-from train.schedule import CosineWithWarmup
-from train.loader import MemmapDataset
-from train.checkpoint import save, load
+from lm import LanguageModel
+from cross_entropy import cross_entropy
+from adamw import AdamW
+from schedule import CosineWithWarmup
+from loader import MemmapDataset
+from checkpoint import save, load
 
 
 def gradient_clipping(parameters, max_norm):
@@ -44,7 +49,12 @@ def gradient_clipping(parameters, max_norm):
 
 
 def train(args):
+    # Resolve device
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU.")
+        args.device = "cpu"
     device = torch.device(args.device)
+
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 

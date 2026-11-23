@@ -5,18 +5,19 @@ Runs a short training loop per variant and reports final loss.
 import os, sys, time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+for _d in (_REPO_ROOT, os.path.join(_REPO_ROOT, "model"), os.path.join(_REPO_ROOT, "tokenizer"), os.path.join(_REPO_ROOT, "train")):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from model.layers import RMSNorm, SwiGLU, Linear
-from train.cross_entropy import cross_entropy
-from train.adamw import AdamW
-from train.loader import MemmapDataset
+from layers import RMSNorm, SwiGLU, Linear
+from cross_entropy import cross_entropy
+from adamw import AdamW
+from loader import MemmapDataset
 
 
 class GeLUMLP(nn.Module):
@@ -61,7 +62,7 @@ class AblLM(nn.Module):
         self.layers = nn.ModuleList()
         for _ in range(layers):
             if rope:
-                from model.block import TransformerBlock
+                from block import TransformerBlock
                 self.layers.append(TransformerBlock(d, heads, ff, norm_cls=NC))
             else:
                 self.layers.append(NoRopeBlock(d, heads, ff, NC))
@@ -70,7 +71,7 @@ class AblLM(nn.Module):
         self.head.weight = self.emb.weight
     def forward(self, x):
         h = self.emb(x)
-        from model.rope import precompute_freqs_cis
+        from rope import precompute_freqs_cis
         fc = precompute_freqs_cis(self.layers[0].attn.head_dim if self.rope else 8, x.shape[1], device=x.device)
         for layer in self.layers:
             h = layer(h, freqs_cis=fc if self.rope else None)
@@ -79,6 +80,12 @@ class AblLM(nn.Module):
 
 
 def run(name, memmap, steps=300, batch=8, seq=128, device="cpu"):
+    # Resolve device
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU.")
+        device = "cpu"
+    device = torch.device(device)
+
     ds = MemmapDataset(memmap, seq)
     cfg = _cfg(name)
     m = AblLM(**cfg).to(device)
@@ -112,8 +119,12 @@ def main():
     p.add_argument("--steps", type=int, default=300)
     p.add_argument("--device", default="cpu")
     a = p.parse_args()
+    print("Ablations (steps=%d, device=%s)" % (a.steps, a.device))
+    print("-" * 50)
     for n in ["base (rope+rms+swiglu)", "no-rope", "layer-norm", "gelu-mlp", "no-rope+ln+gelu"]:
         run(n, a.memmap, steps=a.steps, device=a.device)
+    print("-" * 50)
+    print("Done. Compare final_loss across variants.")
 
 
 if __name__ == "__main__":

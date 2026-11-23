@@ -5,6 +5,8 @@ Usage:
         --vocab-size 10000 --d-model 512 --n-layers 4 --n-heads 16 \
         --d-ff 2048 --device cuda --max-new-tokens 100 \
         --temperature 0.8 --top-p 0.9 --prompt "Once upon a time"
+
+Device-agnostic: --device cuda (if available) or cpu.
 """
 
 import os
@@ -12,17 +14,18 @@ import sys
 import time
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+for _d in (_REPO_ROOT, os.path.join(_REPO_ROOT, "model"), os.path.join(_REPO_ROOT, "tokenizer")):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 import torch
 
-from model.lm import LanguageModel
-from train.checkpoint import load
-from tokenizer.bpe_codec import decode, encode
+from lm import LanguageModel
+from bpe_codec import decode, encode
 
 
 def load_model(checkpoint_path, vocab_size, d_model, n_layers, n_heads, d_ff, device):
+    """Load a trained LanguageModel from a checkpoint file."""
     model = LanguageModel(
         vocab_size=vocab_size,
         d_model=d_model,
@@ -32,10 +35,10 @@ def load_model(checkpoint_path, vocab_size, d_model, n_layers, n_heads, d_ff, de
         device=device,
         dtype=torch.float32,
     )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)  # dummy for load
-    from train.schedule import CosineWithWarmup
-    scheduler = CosineWithWarmup(optimizer, 1e-3, 1, 1)
-    load(model, optimizer, scheduler, checkpoint_path)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+    model.load_state_dict(checkpoint["model"])
     model.eval()
     return model
 
@@ -46,22 +49,23 @@ def sample_next(logits, temperature=1.0, top_p=None, rng=None):
         rng = torch.Generator(device=logits.device)
         rng.seed()
 
-    logits = logits / temperature
+    logits = logits / max(temperature, 1e-6)
     probs = torch.softmax(logits, dim=-1)
 
     if top_p is not None and top_p < 1.0:
         sorted_probs, sorted_indices = torch.sort(probs, descending=True)
         cumulative = torch.cumsum(sorted_probs, dim=-1)
-        # Remove tokens with cumulative probability above top_p.
         sorted_indices_to_remove = cumulative > top_p
-        # Keep the first token above the threshold (shift by 1).
         sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
         sorted_indices_to_remove[..., 0] = False
-        # Unmap sorted removal mask back to original positions.
         indices_to_remove = torch.zeros_like(probs, dtype=torch.bool)
         indices_to_remove[sorted_indices] = sorted_indices_to_remove
         probs = probs.masked_fill(indices_to_remove, 0.0)
-        probs = probs / probs.sum(dim=-1, keepdim=True)
+        probs_sum = probs.sum(dim=-1, keepdim=True)
+        if probs_sum.item() > 0:
+            probs = probs / probs_sum
+        else:
+            probs = torch.full_like(probs, 1.0 / probs.shape[-1])
 
     next_token = torch.multinomial(probs, num_samples=1, generator=rng)
     return next_token
@@ -112,38 +116,30 @@ def _generate_with_kv_cache(model, input_ids, generated, max_new_tokens,
     max_seq = seq_len + max_new_tokens
     k_cache = torch.zeros(batch, n_heads, max_seq, head_dim, device=device)
     v_cache = torch.zeros(batch, n_heads, max_seq, head_dim, device=device)
-    cache_pos = 0  # number of tokens currently cached
 
     # Precompute RoPE freqs for the full max length.
-    from model.rope import precompute_freqs_cis
+    from model.rope import precompute_freqs_cis, apply_rope as _apply_rope
     freqs_cis = precompute_freqs_cis(head_dim, max_seq, device=device)
 
     # Process the prompt through the cache.
     with torch.no_grad():
         h = model.tok_emb(input_ids)
         for layer in model.layers:
-            # Attention with KV cache.
             attn = layer.attn
             norm1_out = layer.norm1(h)
             q = attn.w_q(norm1_out).view(batch, seq_len, n_heads, head_dim)
             k = attn.w_k(norm1_out).view(batch, seq_len, n_heads, head_dim)
             v = attn.w_v(norm1_out).view(batch, seq_len, n_heads, head_dim)
-            q = apply_rope(q, freqs_cis[:seq_len])
-            k = apply_rope(k, freqs_cis[:seq_len])
+            q = _apply_rope(q, freqs_cis[:seq_len])
+            k = _apply_rope(k, freqs_cis[:seq_len])
             k_cache[:, :, :seq_len, :] = k.transpose(1, 2)
             v_cache[:, :, :seq_len, :] = v.transpose(1, 2)
-            cache_pos = seq_len
 
-            # Attention over cached K,V.
             q_t = q.transpose(1, 2)
-            k_t = k_cache[:, :, :cache_pos, :]
-            v_t = v_cache[:, :, :cache_pos, :]
+            k_t = k_cache[:, :, :seq_len, :]
+            v_t = v_cache[:, :, :seq_len, :]
             scores = q_t @ k_t.transpose(-2, -1) / (head_dim ** 0.5)
-            # Causal mask.
-            mask = torch.tril(torch.ones(cache_pos, cache_pos, device=device, dtype=torch.bool))
-            # q is (batch, n_heads, seq_len, head_dim) but we only attend to cache_pos keys.
-            # For generation, we only need the last query position against all cached keys.
-            # Simplify: full attention over cached prefix.
+            mask = torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool))
             scores = scores.masked_fill(~mask, float("-inf"))
             attn_weights = torch.softmax(scores, dim=-1)
             attn_out = attn_weights @ v_t
@@ -156,7 +152,7 @@ def _generate_with_kv_cache(model, input_ids, generated, max_new_tokens,
             last_input = input_ids[:, -1:]
             with torch.no_grad():
                 h = model.tok_emb(last_input)
-                pos = seq_len + step_idx  # RoPE position for this token
+                pos = seq_len + step_idx
                 max_pos = freqs_cis.shape[0] - 1
                 safe_pos = min(pos, max_pos)
                 for layer in model.layers:
@@ -165,13 +161,13 @@ def _generate_with_kv_cache(model, input_ids, generated, max_new_tokens,
                     q = attn.w_q(norm1_out).view(batch, 1, n_heads, head_dim)
                     k = attn.w_k(norm1_out).view(batch, 1, n_heads, head_dim)
                     v = attn.w_v(norm1_out).view(batch, 1, n_heads, head_dim)
-                    q = apply_rope(q, freqs_cis[safe_pos:safe_pos + 1])
-                    k = apply_rope(k, freqs_cis[safe_pos:safe_pos + 1])
+                    q = _apply_rope(q, freqs_cis[safe_pos:safe_pos + 1])
+                    k = _apply_rope(k, freqs_cis[safe_pos:safe_pos + 1])
                     k_cache[:, :, safe_pos, :] = k.transpose(1, 2).squeeze(2)
                     v_cache[:, :, safe_pos, :] = v.transpose(1, 2).squeeze(2)
 
-                    q_t = q.transpose(1, 2)  # (batch, n_heads, 1, head_dim)
-                    k_t = k_cache[:, :, :safe_pos + 1, :]  # all cached keys up to current
+                    q_t = q.transpose(1, 2)
+                    k_t = k_cache[:, :, :safe_pos + 1, :]
                     v_t = v_cache[:, :, :safe_pos + 1, :]
                     scores = q_t @ k_t.transpose(-2, -1) / (head_dim ** 0.5)
                     attn_weights = torch.softmax(scores, dim=-1)
@@ -190,9 +186,30 @@ def _generate_with_kv_cache(model, input_ids, generated, max_new_tokens,
     return generated
 
 
-def apply_rope(x, freqs_cis):
-    from model.rope import apply_rope as _apply_rope
-    return _apply_rope(x, freqs_cis)
+def load_tokenizer(tok_dir):
+    """Load vocab and merges from the tokenizer directory."""
+    vocab_path = os.path.join(tok_dir, "vocab.txt")
+    merges_path = os.path.join(tok_dir, "merges.txt")
+
+    vocab = {}
+    with open(vocab_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            i, h = line.split("\t")
+            vocab[int(i)] = bytes.fromhex(h)
+
+    merges = []
+    with open(merges_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            a, b = line.split("\t")
+            merges.append((bytes.fromhex(a), bytes.fromhex(b)))
+
+    return vocab, merges
 
 
 def main():
@@ -212,21 +229,13 @@ def main():
     p.add_argument("--use-kv-cache", action="store_true")
     args = p.parse_args()
 
-    # Load tokenizer vocab/merges.
-    tok_dir = os.path.join(_REPO_ROOT, "data", "tokenizer")
-    vocab_path = os.path.join(tok_dir, "vocab.txt")
-    merges_path = os.path.join(tok_dir, "merges.txt")
+    # Resolve device
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU.")
+        args.device = "cpu"
 
-    vocab = {}
-    with open(vocab_path, "r", encoding="utf-8") as f:
-        for line in f:
-            i, h = line.strip().split("\t")
-            vocab[int(i)] = bytes.fromhex(h)
-    merges = []
-    with open(merges_path, "r", encoding="utf-8") as f:
-        for line in f:
-            a, b = line.strip().split("\t")
-            merges.append((bytes.fromhex(a), bytes.fromhex(b)))
+    tok_dir = os.path.join(_REPO_ROOT, "data", "tokenizer")
+    vocab, merges = load_tokenizer(tok_dir)
     special_tokens = ["<|endoftext|>"]
 
     model = load_model(

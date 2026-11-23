@@ -7,18 +7,22 @@ Communication is explicit so the engineering is transparent.
 import os, sys, math
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+for _d in (_REPO_ROOT, os.path.join(_REPO_ROOT, "model"), os.path.join(_REPO_ROOT, "tokenizer")):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
 
 import torch
 import torch.distributed as dist
 
 
 def setup(backend="gloo"):
+    """Initialize the process group from environment variables (torchrun).
+
+    Falls back to sensible defaults for single-process local runs.
+    """
     rank = int(os.environ.get("RANK", "0"))
     world = int(os.environ.get("WORLD_SIZE", "1"))
     local = int(os.environ.get("LOCAL_RANK", "0"))
-    # Set defaults for single-process / local runs
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
     if not dist.is_initialized():
@@ -32,6 +36,12 @@ def cleanup():
 
 
 def all_reduce_bucketed(grads, bucket_mb=25):
+    """All-reduce a list of gradient tensors using buckets.
+
+    Gradients are grouped into buckets of ~bucket_mb megabytes so that many
+    small tensors are reduced in a single collective, reducing launch overhead.
+    Each bucket is all-reduced in place (divided by world_size).
+    """
     world = dist.get_world_size()
     if world == 1:
         return
@@ -146,6 +156,7 @@ class ShardedAdamW(torch.optim.Optimizer):
 
 
 def ddp_step(model, optimizer, x, y, criterion, grad_clip=1.0, bucketed=True):
+    """Single DDP training step: forward, backward, bucketed all-reduce grads, optimizer step."""
     optimizer.zero_grad()
     logits = model(x)
     loss = criterion(logits, y)
@@ -179,17 +190,15 @@ if __name__ == "__main__":
     rank, world, local = setup(backend="gloo")
     print(f"Distributed setup: rank={rank}, world_size={world}, local_rank={local}")
 
-    # Tiny model for the demo
     model = nn.Linear(16, 16)
     criterion = nn.MSELoss()
     optimizer = ShardedAdamW(model.parameters(), lr=1e-3)
 
-    # Single training step
     x = torch.randn(4, 16)
     y = torch.randn(4, 16)
     loss = ddp_step(model, optimizer, x, y, criterion, grad_clip=1.0, bucketed=True)
     print(f"DDP step loss: {loss:.4f}")
-    print(f"Optimizer step complete (sharded AdamW, gradient bucketing)")
+    print("Optimizer step complete (sharded AdamW, gradient bucketing)")
 
     cleanup()
     print("Distributed demo complete.")
